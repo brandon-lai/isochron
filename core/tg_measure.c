@@ -1,0 +1,383 @@
+/*
+    tg
+    Copyright (C) 2015 Marcello Mamino
+
+    Modified 2026-08-29 by MAC Bespoke Watch Co.: this file carries the
+    measurement logic that upstream keeps in src/computer.c — guess_bph() and
+    the conversions in compute_results() — with the pthread scaffolding and the
+    calibration state machine left behind. The arithmetic is unchanged. The
+    surrounding tg_* embedding API is new.
+
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License version 2 as
+    published by the Free Software Foundation.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License along
+    with this program; if not, write to the Free Software Foundation, Inc.,
+    51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+*/
+
+#include "tg_core.h"
+
+/* Upstream defines this in interface.c, which is GTK. */
+int preset_bph[] = PRESET_BPH;
+
+struct tg_state {
+	tg_config config;
+
+	struct processing_buffers *steps;  /* NSTEPS windows, 2s to 16s */
+	int initialized_steps;
+
+	float   *ring;      /* most recent audio, sized to the longest window */
+	int      ring_size;
+	int      write_pos;
+	uint64_t total_pushed;
+
+	/* The window whose analysis was accepted by the last tg_get_result, so
+	   tg_get_events can read the beat positions it found. NULL until then. */
+	struct processing_buffers *selected;
+
+	/* Non-NULL only while a calibration run is going. */
+	struct calibration_data *cal;
+};
+
+/*
+   Unchanged from computer.c. Picks the nearest standard beat rate to the
+   measured one, which is why a movement running badly still reports 21600
+   rather than some arbitrary number.
+*/
+static int guess_bph(double period)
+{
+	double bph = 7200 / period;
+	double min = bph;
+	int i, ret;
+
+	ret = 0;
+	for(i = 0; preset_bph[i]; i++) {
+		double diff = fabs(bph - preset_bph[i]);
+		if(diff < min) {
+			min = diff;
+			ret = i;
+		}
+	}
+
+	return preset_bph[ret];
+}
+
+const char *tg_version(void)
+{
+	return "tg-core 0.1 (derived from tg 0.8.0)";
+}
+
+tg_handle tg_init(tg_config config)
+{
+	if(config.sample_rate <= 0) return NULL;
+	if(config.lift_angle < MIN_LA || config.lift_angle > MAX_LA) return NULL;
+	if(config.bph != 0 && (config.bph < MIN_BPH || config.bph > MAX_BPH)) return NULL;
+
+	struct tg_state *s = calloc(1, sizeof(*s));
+	if(!s) return NULL;
+	s->config = config;
+
+	s->steps = calloc(NSTEPS, sizeof(struct processing_buffers));
+	if(!s->steps) { free(s); return NULL; }
+
+	/* Windows of 2, 4, 8 and 16 seconds. process() is run shortest first and
+	   the longest window that converged wins, so a short recording still
+	   produces a reading — just a less certain one. */
+	for(int i = 0; i < NSTEPS; i++) {
+		s->steps[i].sample_rate  = config.sample_rate;
+		s->steps[i].sample_count = config.sample_rate * (1 << (i + FIRST_STEP));
+		setup_buffers(&s->steps[i]);
+		s->initialized_steps++;
+	}
+
+	s->ring_size = s->steps[NSTEPS - 1].sample_count;
+	s->ring = calloc(s->ring_size, sizeof(float));
+	if(!s->ring) { tg_destroy(s); return NULL; }
+
+	return s;
+}
+
+void tg_push_samples(tg_handle h, const float *samples, int count)
+{
+	if(!h || !samples || count <= 0) return;
+
+	/* A push longer than the ring can only leave its tail behind. */
+	if(count > h->ring_size) {
+		samples += count - h->ring_size;
+		count = h->ring_size;
+	}
+
+	int first = h->ring_size - h->write_pos;
+	if(first > count) first = count;
+	memcpy(h->ring + h->write_pos, samples, first * sizeof(float));
+	if(count > first)
+		memcpy(h->ring, samples + first, (count - first) * sizeof(float));
+
+	h->write_pos = (h->write_pos + count) % h->ring_size;
+	h->total_pushed += count;
+}
+
+/* C's % keeps the sign of the dividend, so a negative index needs correcting
+   before it can address the ring. */
+static int wrap(int i, int n)
+{
+	int m = i % n;
+	return m < 0 ? m + n : m;
+}
+
+/* Copy the most recent sample_count samples out of the ring, oldest first. */
+static void fill_step(struct tg_state *s, struct processing_buffers *p)
+{
+	int start = wrap(s->write_pos - p->sample_count, s->ring_size);
+	int first = s->ring_size - start;
+	if(first > p->sample_count) first = p->sample_count;
+	memcpy(p->samples, s->ring + start, first * sizeof(float));
+	if(p->sample_count > first)
+		memcpy(p->samples + first, s->ring, (p->sample_count - first) * sizeof(float));
+	p->timestamp = s->total_pushed;
+}
+
+tg_result tg_get_result(tg_handle h)
+{
+	tg_result r = { 0, 0, 0, 0, 0.0, 0 };
+	if(!h) return r;
+
+	/* Nothing useful before the shortest window is full. */
+	if(h->total_pushed < (uint64_t)h->steps[0].sample_count) {
+		r.detected_bph = h->config.bph ? h->config.bph : DEFAULT_BPH;
+		return r;
+	}
+
+	int ready = 0;
+	for(int i = 0; i < NSTEPS; i++) {
+		if((uint64_t)h->steps[i].sample_count > h->total_pushed) break;
+		fill_step(h, &h->steps[i]);
+		h->steps[i].last_tic = 0;
+		/* locate_events() sizes a stack array from (timestamp - events_from)
+		   and gives up entirely if that spans more than EVENTS_MAX beats, so
+		   this window has to stay short. Four seconds is at most ~82 events
+		   even at 72000 bph, comfortably inside the limit, and the caller
+		   polls far more often than that. Leaving it at 0 means the core
+		   silently reports no beats at all. */
+		h->steps[i].events_from =
+			h->steps[i].timestamp > (uint64_t)(4 * h->config.sample_rate)
+				? h->steps[i].timestamp - (uint64_t)(4 * h->config.sample_rate)
+				: 0;
+		process(&h->steps[i], h->config.bph, h->config.lift_angle, 0);
+		if(!h->steps[i].ready) break;
+		ready++;
+	}
+
+	/* Walk back from the longest converged window to one whose spread is
+	   tight enough to trust. Unchanged from compute_update(). */
+	int i = ready - 1;
+	for(; i >= 0 && h->steps[i].sigma > h->steps[i].period / 10000; i--);
+
+	if(i < 0) {
+		h->selected = NULL;
+		r.detected_bph = h->config.bph ? h->config.bph : DEFAULT_BPH;
+		return r;
+	}
+
+	struct processing_buffers *p = &h->steps[i];
+	h->selected = p;
+	double sample_rate = h->config.sample_rate;
+
+	/* The conversions below are compute_results() verbatim, minus the
+	   calibration term, which this milestone does not carry. */
+	r.detected_bph = h->config.bph ? h->config.bph : guess_bph(p->period / sample_rate);
+	r.rate = (7200 / (r.detected_bph * p->period / sample_rate) - 1) * 24 * 3600;
+	r.beat_error = fabs(p->be) * 1000 / sample_rate;
+	r.amplitude = h->config.lift_angle * p->amp;
+	if(r.amplitude < 135 || r.amplitude > 360)
+		r.amplitude = 0; /* upstream treats out-of-range as "not available" */
+
+	/* How many windows converged, as a fraction of all of them. */
+	r.signal_quality = (double)ready / NSTEPS;
+	r.valid = 1;
+
+	return r;
+}
+
+int tg_get_events(tg_handle h, double *out_time, unsigned char *out_tictoc, int max)
+{
+	if(!h || !h->selected || !out_time || !out_tictoc || max <= 0) return 0;
+
+	struct processing_buffers *p = h->selected;
+	double rate = h->config.sample_rate;
+	int n = 0;
+
+	/* p->events is a 0-terminated list of absolute sample positions. Returned
+	   as seconds since capture started: the trace plots beats against time,
+	   and a double holds that exactly for far longer than any session. */
+	for(int i = 0; i < EVENTS_MAX && n < max; i++) {
+		if(p->events[i] == 0) break;
+		out_time[n] = (double)p->events[i] / rate;
+		out_tictoc[n] = p->events_tictoc[i];
+		n++;
+	}
+	return n;
+}
+
+/*
+   One window of the averaged beat, resampled to a fixed grid.
+
+   draw_graph() in the GTK panel reads p->waveform at pixel resolution with
+   nearest-neighbour indexing, which it can do because it knows the width of
+   the widget it is drawing into. Here the consumer is a canvas of unknown
+   size on a device of unknown sample rate, so the window is resampled once,
+   and each output point takes the MAXIMUM of the input samples falling in it
+   rather than one of them. At two input samples per point, nearest-neighbour
+   would drop the impulse spike about half the time, and the impulse is the
+   feature the whole display exists to show.
+*/
+static void window_waveform(struct processing_buffers *p, int offset,
+			double span, float *out, int points)
+{
+	double first = offset - span * TG_WAVEFORM_MS_BEFORE;
+	double width = span * (TG_WAVEFORM_MS_BEFORE + TG_WAVEFORM_MS_AFTER);
+	/* 0.4 is upstream's headroom factor, kept so the curve has the same
+	   proportions here as in the GTK panel. */
+	double scale = 0.4 / p->waveform_max;
+
+	for(int i = 0; i < points; i++) {
+		double from = first + i * width / points;
+		double to = first + (i + 1) * width / points;
+		double peak = 0;
+
+		for(double s = floor(from); s < to; s++) {
+			double x = fmod(s, p->period);
+			if(x < 0) x += p->period;
+			double y = p->waveform[(int)x];
+			if(y > peak) peak = y;
+		}
+		out[i] = (float)(peak * scale);
+	}
+}
+
+int tg_get_waveform(tg_handle h, float *out_tic, float *out_toc, tg_waveform *info)
+{
+	if(info) memset(info, 0, sizeof(*info));
+	if(!h || !h->selected || !out_tic || !out_toc || !info) return 0;
+
+	struct processing_buffers *p = h->selected;
+	/* waveform_max is the divisor; a silent window would divide by zero. */
+	if(p->period <= 0 || p->waveform_max <= 0) return 0;
+
+	double span = h->config.sample_rate / 1000.0; /* samples per millisecond */
+
+	window_waveform(p, p->tic, span, out_tic, TG_WAVEFORM_POINTS);
+	window_waveform(p, p->toc, span, out_toc, TG_WAVEFORM_POINTS);
+
+	info->points = TG_WAVEFORM_POINTS;
+	info->ms_before = TG_WAVEFORM_MS_BEFORE;
+	info->ms_after = TG_WAVEFORM_MS_AFTER;
+	info->period_seconds = p->period / h->config.sample_rate;
+	/* Upstream draws the marker only for a positive pulse; -1 says "no mark". */
+	info->tic_pulse_ms = p->tic_pulse > 0 ? p->tic_pulse / span : -1;
+	info->toc_pulse_ms = p->toc_pulse > 0 ? p->toc_pulse / span : -1;
+	info->valid = 1;
+
+	return TG_WAVEFORM_POINTS;
+}
+
+/*
+   analyze_pa_data_cal() from audio.c, with the buffer filling replaced by our
+   ring copy. The shorter windows are only run to gauge how well the tick is
+   locked; the fit itself always uses the longest one, because a fifteen-minute
+   measurement of a one-second period has no reason to settle for less.
+*/
+int tg_cal_begin(tg_handle h)
+{
+	if(!h) return 0;
+	tg_cal_end(h);
+
+	h->cal = calloc(1, sizeof(*h->cal));
+	if(!h->cal) return 0;
+	setup_cal_data(h->cal);
+	if(!h->cal->times || !h->cal->phases || !h->cal->events) {
+		tg_cal_end(h);
+		return 0;
+	}
+	/* The audio already in the ring belongs to whatever was on the sensor
+	   before, which is not the reference watch. */
+	tg_reset(h);
+	return 1;
+}
+
+void tg_cal_end(tg_handle h)
+{
+	if(!h || !h->cal) return;
+	cal_data_destroy(h->cal);
+	free(h->cal);
+	h->cal = NULL;
+}
+
+tg_cal tg_cal_update(tg_handle h)
+{
+	tg_cal r = { 0, CAL_DATA_SIZE, 0, 0, 0 };
+	if(!h || !h->cal) return r;
+
+	r.collected = h->cal->wp;
+	r.state = h->cal->state;
+	if(h->cal->state == 1)
+		r.drift_seconds_per_day = h->cal->calibration;
+
+	/* A one-second period needs at least two seconds of window to be seen at
+	   all, which is the shortest step we build. */
+	int first = 0;
+	while(first < NSTEPS && h->steps[first].sample_count < 2 * h->config.sample_rate)
+		first++;
+	if(first >= NSTEPS) return r;
+
+	/* Nothing to analyse until the longest window has been filled once. */
+	if(h->total_pushed < (uint64_t)h->steps[NSTEPS - 1].sample_count) return r;
+
+	for(int i = first; i < NSTEPS - 1; i++) {
+		fill_step(h, &h->steps[i]);
+		if(test_cal(&h->steps[i])) {
+			r.signal = i > first ? i : 0;
+			return r;
+		}
+	}
+
+	fill_step(h, &h->steps[NSTEPS - 1]);
+	if(process_cal(&h->steps[NSTEPS - 1], h->cal)) {
+		r.signal = NSTEPS - 1;
+		return r;
+	}
+	r.signal = NSTEPS;
+
+	r.collected = h->cal->wp;
+	r.state = h->cal->state;
+	if(h->cal->state == 1)
+		r.drift_seconds_per_day = h->cal->calibration;
+	return r;
+}
+
+void tg_reset(tg_handle h)
+{
+	if(!h) return;
+	h->selected = NULL;
+	memset(h->ring, 0, h->ring_size * sizeof(float));
+	h->write_pos = 0;
+	h->total_pushed = 0;
+}
+
+void tg_destroy(tg_handle h)
+{
+	if(!h) return;
+	tg_cal_end(h);
+	for(int i = 0; i < h->initialized_steps; i++)
+		pb_destroy(&h->steps[i]);
+	free(h->steps);
+	free(h->ring);
+	free(h);
+}

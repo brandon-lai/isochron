@@ -1,0 +1,26 @@
+Isochron — Acoustic Mechanical Watch Timegrapher PWA
+Copyright (C) 2026 Brandon Lai
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License version 2 only, as published by
+the Free Software Foundation. See LICENSE for the full license text.
+
+Upstream Signal-Processing Attribution
+--------------------------------------
+Isochron's WebAssembly acoustic analysis core (`core/`, `wasm/`, and
+`public/wasm/tg-core.{js,wasm}`) is derived from:
+
+1. `tg` (Timegrapher for mechanical watches)
+   Copyright (C) 2015-2016 Marcello Mamino <vacaboja@gmail.com>
+   https://github.com/vacaboja/tg
+   Maintained by Alejandro Grigera: https://github.com/agrigera/tg
+
+2. `mac-timegrapher` (C core extraction, Emscripten WebAssembly bindings,
+   AudioWorklet capture processor, and stability spread mathematics)
+   Copyright (C) 2026 MAC Bespoke Watch Co.
+   https://github.com/natemac/mac-timegrapher
+
+All MAC Bespoke Watch Co. logos and brand marks are excluded. On-page
+application architecture, Braun/Witschi minimalist instrument interface,
+synthetic 48 kHz mechanical watch reference generator, multi-format audio
+file decoder, and Next.js PWA shell were created for Isochron on 2026-11-23.
