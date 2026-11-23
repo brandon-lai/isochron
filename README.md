@@ -24,6 +24,7 @@ Acoustic watch timegraphing is a solved open-source signal-processing problem. R
 - **Balance Amplitude Sensitivity:** Accurate amplitude (`°`) requires clean acoustic separation between the tiny unlocking click and the louder locking drop impulse. Thick dive cases or ambient room noise can mask the unlock transient on an air-coupled mic; a `$15–$25` clip-on piezo contact watch microphone (TRRS or USB-C) couples directly through the steel caseback for bench-grade amplitude readings.
 - **Crystal Clock Calibration:** Consumer audio ADC crystals typically exhibit `±5–30 ppm` clock tolerance (`1 ppm = 0.0864 s/d`). Isochron includes manual `±0.1 s/d` crystal trim and a live **1 Hz Quartz Reference Check** inside the **Calibrate** dialog.
 - **Privacy & Offline Operation:** All DSP executes locally inside WebAssembly (`public/sw.js` caches the shell, workers, and `tg-core.wasm` for airplane-mode bench use). Zero audio is ever uploaded.
+- **Bench Shortcuts & Slip Export:** Press `Space` to start/stop listening, `L` to log the active ISO 3159 position (`DU`, `DD`, `CU`, `CD`, `12U`, `12D`), `R` to clear the trace, and `D` to toggle Light/Dark appearance. Export captured `.wav` audio or print a monochrome timing slip directly from the browser.
 
 ## Development & Verification
 
